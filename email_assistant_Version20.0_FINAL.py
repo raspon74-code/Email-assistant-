@@ -39,6 +39,12 @@ import schedule
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+try:
+    from requests_kerberos import HTTPKerberosAuth, OPTIONAL
+    KERBEROS_AVAILABLE = True
+except ImportError:
+    KERBEROS_AVAILABLE = False
+
 # =========================================================
 # CONFIGURATION
 # =========================================================
@@ -309,12 +315,19 @@ def fetch_oas_vessels():
         }
 
         log(f"🌐 Fetching OAS vessel list ({date_from[:10]} → {date_to[:10]}) …")
+        auth = HTTPKerberosAuth(mutual_authentication=OPTIONAL) if KERBEROS_AVAILABLE else None
+        if KERBEROS_AVAILABLE:
+            log("🔐 Using Kerberos authentication for OAS API")
+        else:
+            log("⚠️ requests-kerberos not available, trying without auth")
+
         response = requests.post(
             OAS_API_URL,
             json=payload,
             proxies=PROXIES,
-            timeout=30,
-            verify=False
+            timeout=60,
+            verify=False,
+            auth=auth
         )
         response.raise_for_status()
         data = response.json()
@@ -1680,7 +1693,7 @@ def send_summary_to_teams(emails, events, weather, vessels_info, pilot_status, t
 
 def run_summary_agent():
     log("=" * 60)
-    log("🚀 Email Assistant v21.0 - INTELLIGENT VERSION")
+    log("🚀 Email Assistant v21.0 - INTELLIGENT VERSION (Kerberos SSO enabled)" if KERBEROS_AVAILABLE else "🚀 Email Assistant v21.0 - INTELLIGENT VERSION")
     log("✅ Email-to-Checklist | ✅ Anchored Date | ✅ Status Display")
     log("=" * 60)
 
