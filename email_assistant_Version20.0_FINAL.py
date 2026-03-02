@@ -277,17 +277,58 @@ def save_pilot_status(status):
     except:
         pass
 
+def get_oas_token():
+    """Read OAS-TOKEN from oas_token.txt, with clear error messages."""
+    token_file = "oas_token.txt"
+    if not os.path.exists(token_file):
+        log("⚠️ OAS: oas_token.txt not found — run refresh_token_helper.py each morning to set it up")
+        return None
+    try:
+        with open(token_file, "r") as f:
+            token = f.read().strip()
+        if not token:
+            log("⚠️ OAS: oas_token.txt is empty — run refresh_token_helper.py to refresh")
+            return None
+        return token
+    except Exception as e:
+        log(f"⚠️ OAS: Could not read oas_token.txt: {e}")
+        return None
+
+def notify_token_expired():
+    """Show a Windows toast notification that the OAS token needs refreshing."""
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            "The OAS-TOKEN has expired.\n\nPlease run refresh_token_helper.py to refresh it.\n\n(Takes less than 30 seconds)",
+            "Email Assistant — OAS Token Expired",
+            0x30  # MB_ICONWARNING
+        )
+    except Exception:
+        pass  # Notification is best-effort
+
 def fetch_oas_vessels():
     """Fetch the vessel/shipment list from the Shell OAS Shipment Planner API.
 
+    Uses OAS-TOKEN cookie from oas_token.txt (session cookie, lasts full work day).
+    No proxy — OAS API must be called directly, bypassing the corporate proxy.
     Updates the global KNOWN_VESSELS dict and merges vessel data into the
-    persisted jetty timeline.  Returns (known_vessels_dict, timeline_vessels_list).
+    persisted jetty timeline. Returns (known_vessels_dict, timeline_vessels_list).
     On any failure the function logs the error and returns ({}, []).
     """
     global KNOWN_VESSELS
+
+    token = get_oas_token()
+    if not token:
+        return {}, []
+
     try:
-        now = datetime.now().astimezone()
-        tz_offset = now.strftime("%z")
+        # Clear any bad proxy environment variables that would block direct access
+        for _var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ.pop(_var, None)
+
+        now = datetime.now()
+        tz_offset = now.astimezone().strftime("%z")
         tz_offset = f"{tz_offset[:3]}:{tz_offset[3:]}"  # e.g. "+01:00"
         date_from = (now - timedelta(days=OAS_DAYS_BACK)).strftime(f"%Y-%m-%dT00:00:00{tz_offset}")
         date_to   = (now + timedelta(days=OAS_DAYS_AHEAD)).strftime(f"%Y-%m-%dT00:00:00{tz_offset}")
@@ -308,23 +349,48 @@ def fetch_oas_vessels():
             "TransportName": None
         }
 
+        headers = {
+            "Content-Type": "application/json",
+            "Origin": "https://nl.oas.shell.com",
+            "User-Agent": "Mozilla/5.0",
+        }
+
+        cookies = {"OAS-TOKEN": token}
+
         log(f"🌐 Fetching OAS vessel list ({date_from[:10]} → {date_to[:10]}) …")
+
         response = requests.post(
             OAS_API_URL,
             json=payload,
-            proxies=PROXIES,
+            headers=headers,
+            cookies=cookies,
+            proxies={"http": None, "https": None},  # Bypass corporate proxy — OAS is internal
             timeout=30,
             verify=False
         )
+
+        if response.status_code in (401, 403):
+            log("⚠️ OAS token expired or not accepted — please run refresh_token_helper.py")
+            notify_token_expired()
+            return {}, []
+
         response.raise_for_status()
         data = response.json()
 
-        if not data:
-            log("⚠️ OAS API returned an empty response.")
+        # Handle both list response and dict with Items key
+        if isinstance(data, dict):
+            items = data.get("Items", [])
+        elif isinstance(data, list):
+            items = data
+        else:
+            items = []
+
+        if not items:
+            log("⚠️ OAS API returned no vessel records.")
             return {}, []
 
-        # Log the first record so field names can be verified at runtime
-        log(f"🔍 OAS first record (for field-name verification): {data[0]}")
+        # Log first record for field-name verification
+        log(f"🔍 OAS first record sample: {str(items[0])[:300]}")
 
         STATUS_MAP = {
             1: "Nominated", 2: "Confirmed", 3: "Planned", 4: "In Port",
@@ -335,38 +401,43 @@ def fetch_oas_vessels():
         new_known = {}
         oas_vessels = []
 
-        for record in data:
-            # Vessel name
-            name = (
-                record.get("TransportName") or
-                record.get("VesselName") or
-                record.get("ShipName") or ""
-            ).strip().upper()
-            if not name:
+        for record in items:
+            # Vessel name — confirmed field name from API
+            name = str(record.get("TRANSPORT_NAME") or "").strip().upper()
+            if not name or name in ("NONE", "NULL", ""):
                 continue
 
-            # Identifier (IMO preferred, then ENI)
+            # Identifier
             imo = str(record.get("IMO") or record.get("Imo") or "").strip()
             eni = str(record.get("ENI") or record.get("Eni") or "").strip()
             identifier = imo if imo else (f"EN{eni}" if eni else "")
             if identifier:
                 new_known[name] = identifier
 
-            # Dates
-            eta = (record.get("ETA") or record.get("Eta") or record.get("DateFrom") or "")
-            etd = (record.get("ETD") or record.get("Etd") or record.get("DateTo") or "")
+            # Dates — confirmed field names from API
+            eta = str(record.get("ETA") or "").strip()
+            etd = str(record.get("ETD") or "").strip()
 
-            # Other fields
-            berth         = (record.get("BerthCode") or record.get("Berth") or record.get("JettyCode") or "")
-            grade         = (record.get("GradeName") or record.get("Grade") or "")
-            agent         = (record.get("AgentName") or record.get("Agent") or "")
-            surveyor      = (record.get("SurveyorName") or record.get("Surveyor") or "")
-            status_code   = record.get("NStatus") or record.get("StatusFrom") or 0
+            # Grade — from GRADES array
+            grade = ""
+            grades = record.get("GRADES") or []
+            if grades and isinstance(grades, list):
+                grade_descs = [g.get("GRADE_DESC", "") for g in grades if g.get("GRADE_DESC")]
+                grade = ", ".join(grade_descs[:2])
+
+            # Other confirmed fields
+            berth        = str(record.get("BERTH") or "").strip()
+            agent        = str(record.get("AGENT_ID") or "").strip()
+            surveyor     = str(record.get("INSPECTOR_ID") or "").strip()
+            shipment_ref = str(record.get("SHIPMENT_REF") or record.get("SHIPMENT_ID") or "").strip()
+            site         = str(record.get("SITE") or "").strip()
+
+            # Status
+            status_code = record.get("NOM_NSTATUS") or record.get("SHIPMENT_STATUS") or 0
             try:
-                status_label  = STATUS_MAP.get(int(status_code), str(status_code)) if status_code else ""
+                status_label = STATUS_MAP.get(int(status_code), str(status_code)) if status_code else ""
             except (ValueError, TypeError):
-                status_label  = str(status_code)
-            shipment_ref  = (record.get("ShipmentRef") or record.get("ShipmentId") or "")
+                status_label = str(status_code)
 
             oas_vessels.append({
                 "name":         name,
@@ -374,11 +445,15 @@ def fetch_oas_vessels():
                 "eta":          eta,
                 "etd":          etd,
                 "berth":        berth,
+                "jetty":        berth,  # map berth → jetty for timeline compatibility
+                "cargo":        grade,
                 "grade":        grade,
                 "agent":        agent,
-                "surveyor":     surveyor,
+                "surveyor":     surveyor if surveyor not in ("NIET VAN TOEPASSING", "NONE", "") else "",
                 "status":       status_label,
+                "status_desc":  status_label,
                 "shipment_ref": shipment_ref,
+                "site":         site,
                 "source":       "OAS"
             })
 
