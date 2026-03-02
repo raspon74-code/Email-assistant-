@@ -1,5 +1,5 @@
 """
-Version 20.0 FINAL – Email Assistant - INTELLIGENT PRODUCTION VERSION
+Version 21.0 – Email Assistant - INTELLIGENT PRODUCTION VERSION
 
 NEW FEATURES:
 ✅ Smart Email-to-Checklist Integration (keyword parsing)
@@ -9,6 +9,7 @@ NEW FEATURES:
 ✅ Source Tracking (📧 email vs 📊 Excel)
 ✅ Conflict Detection (email vs Excel discrepancies)
 ✅ Confidence Scoring (how certain we are about updates)
+✅ OAS API Integration (auto vessel list from Shipment Planner)
 
 EXISTING FEATURES:
 ✅ Calendar Integration
@@ -19,6 +20,10 @@ EXISTING FEATURES:
 ✅ Vessel Tracking
 ✅ Smart Email Processing
 ✅ Teams Integration
+
+NOTE: The JSON field names returned by the OAS API may differ from the defaults
+used in fetch_oas_vessels(). On first run, check the log for "OAS first record"
+to verify the exact field names and adjust the .get() calls if needed.
 """
 
 import win32com.client
@@ -82,13 +87,17 @@ JETTY_CONFIG = {
     "ST35A": {"name": "Single Jetty 35A", "min_length": 85, "max_length": 185}
 }
 
-KNOWN_VESSELS = {
-    "TEMPEST": "9424754", "SEFARINA": "9715701", "CHEMICAL LUNA": "9521423",
-    "SFL BONAIRE": "9919773", "XING TONG KAI YUAN": "9640126", "VOYAGER": "02332403",
-    "KENTERING": "02211189", "LEONARDO": "07001724", "STOLT MERWEDE": "9232490",
-    "BARCELONA": "9233647", "BITHAV": "9999998", "VICTROL": "9999999", "UNIGAS II": "02340295",
-    "BAYAMO": "9655004", "UNIGAS III": "EN02340282", "UNIGAS I": "EN02340295"
-}
+KNOWN_VESSELS = {}  # Populated dynamically from OAS API on each agent cycle
+
+# =========================================================
+# OAS SHIPMENT PLANNER API CONFIGURATION
+# =========================================================
+OAS_API_URL     = "https://nl.oas.shell.com/OASV6/coreapi/api/oard1000/GetExplorerShipmentSummary"
+OAS_SITE        = "PERNIS"       # Change to match your site
+OAS_STATUS_FROM = 5              # Status from: Trading/Supply
+OAS_STATUS_TO   = 10             # Status to: Completed/On-going
+OAS_DAYS_AHEAD  = 14             # How many days ahead to fetch
+OAS_DAYS_BACK   = 2              # How many days back to include
 
 AGENT_EMAILS = ["wilhelmsen.com", "lbhnetherlands.com", "chemship.com", "vertomcory.com", "iss-shipping.com"]
 
@@ -267,6 +276,143 @@ def save_pilot_status(status):
             json.dump(status, f, indent=2)
     except:
         pass
+
+def fetch_oas_vessels():
+    """Fetch the vessel/shipment list from the Shell OAS Shipment Planner API.
+
+    Updates the global KNOWN_VESSELS dict and merges vessel data into the
+    persisted jetty timeline.  Returns (known_vessels_dict, timeline_vessels_list).
+    On any failure the function logs the error and returns ({}, []).
+    """
+    global KNOWN_VESSELS
+    try:
+        now = datetime.now().astimezone()
+        tz_offset = now.strftime("%z")
+        tz_offset = f"{tz_offset[:3]}:{tz_offset[3:]}"  # e.g. "+01:00"
+        date_from = (now - timedelta(days=OAS_DAYS_BACK)).strftime(f"%Y-%m-%dT00:00:00{tz_offset}")
+        date_to   = (now + timedelta(days=OAS_DAYS_AHEAD)).strftime(f"%Y-%m-%dT00:00:00{tz_offset}")
+
+        payload = {
+            "Agent": None,
+            "Company": None,
+            "DateFrom": date_from,
+            "DateTo": date_to,
+            "Inspector": None,
+            "Port": None,
+            "ShipmentId": None,
+            "ShipmentRef": None,
+            "Site": OAS_SITE,
+            "StatusFrom": OAS_STATUS_FROM,
+            "StatusTo": OAS_STATUS_TO,
+            "Timestamp": None,
+            "TransportName": None
+        }
+
+        log(f"🌐 Fetching OAS vessel list ({date_from[:10]} → {date_to[:10]}) …")
+        response = requests.post(
+            OAS_API_URL,
+            json=payload,
+            proxies=PROXIES,
+            timeout=30,
+            verify=False
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if not data:
+            log("⚠️ OAS API returned an empty response.")
+            return {}, []
+
+        # Log the first record so field names can be verified at runtime
+        log(f"🔍 OAS first record (for field-name verification): {data[0]}")
+
+        STATUS_MAP = {
+            1: "Nominated", 2: "Confirmed", 3: "Planned", 4: "In Port",
+            5: "Trading/Supply", 6: "Loading", 7: "Loaded",
+            8: "Sailing", 9: "Arrived", 10: "Completed"
+        }
+
+        new_known = {}
+        oas_vessels = []
+
+        for record in data:
+            # Vessel name
+            name = (
+                record.get("TransportName") or
+                record.get("VesselName") or
+                record.get("ShipName") or ""
+            ).strip().upper()
+            if not name:
+                continue
+
+            # Identifier (IMO preferred, then ENI)
+            imo = str(record.get("IMO") or record.get("Imo") or "").strip()
+            eni = str(record.get("ENI") or record.get("Eni") or "").strip()
+            identifier = imo if imo else (f"EN{eni}" if eni else "")
+            if identifier:
+                new_known[name] = identifier
+
+            # Dates
+            eta = (record.get("ETA") or record.get("Eta") or record.get("DateFrom") or "")
+            etd = (record.get("ETD") or record.get("Etd") or record.get("DateTo") or "")
+
+            # Other fields
+            berth         = (record.get("BerthCode") or record.get("Berth") or record.get("JettyCode") or "")
+            grade         = (record.get("GradeName") or record.get("Grade") or "")
+            agent         = (record.get("AgentName") or record.get("Agent") or "")
+            surveyor      = (record.get("SurveyorName") or record.get("Surveyor") or "")
+            status_code   = record.get("NStatus") or record.get("StatusFrom") or 0
+            try:
+                status_label  = STATUS_MAP.get(int(status_code), str(status_code)) if status_code else ""
+            except (ValueError, TypeError):
+                status_label  = str(status_code)
+            shipment_ref  = (record.get("ShipmentRef") or record.get("ShipmentId") or "")
+
+            oas_vessels.append({
+                "name":         name,
+                "identifier":   identifier,
+                "eta":          eta,
+                "etd":          etd,
+                "berth":        berth,
+                "grade":        grade,
+                "agent":        agent,
+                "surveyor":     surveyor,
+                "status":       status_label,
+                "shipment_ref": shipment_ref,
+                "source":       "OAS"
+            })
+
+        KNOWN_VESSELS = new_known
+        log(f"✅ OAS: {len(KNOWN_VESSELS)} vessels fetched.")
+
+        # Merge into timeline
+        timeline = load_timeline()
+        existing = {v["name"]: v for v in timeline.get("vessels", []) if "name" in v}
+        updated = 0
+
+        for oas_v in oas_vessels:
+            vname = oas_v["name"]
+            if vname in existing:
+                # Preserve email-sourced fields
+                for keep in ("anchored_date", "confidence", "email_notes"):
+                    if keep in existing[vname]:
+                        oas_v[keep] = existing[vname][keep]
+                existing[vname] = oas_v
+            else:
+                oas_v["anchored_date"] = None
+                existing[vname] = oas_v
+            updated += 1
+
+        timeline["vessels"] = list(existing.values())
+        save_timeline(timeline)
+        log(f"📊 Timeline updated: {updated} OAS vessel entries merged.")
+
+        return KNOWN_VESSELS, timeline["vessels"]
+
+    except Exception as e:
+        log(f"❌ fetch_oas_vessels error: {e}")
+        log_exception(e)
+        return {}, []
 
 # =========================================================
 # VESSEL FUNCTIONS
@@ -1485,7 +1631,7 @@ def send_summary_to_teams(emails, events, weather, vessels_info, pilot_status, t
         else:
             card_body.append({"type": "TextBlock", "text": "✅ No meetings scheduled", "color": "Good"})
 
-        card_body.append({"type": "TextBlock", "text": f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | v20.0 FINAL", "size": "Small", "isSubtle": True, "separator": True})
+        card_body.append({"type": "TextBlock", "text": f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | v21.0", "size": "Small", "isSubtle": True, "separator": True})
 
         payload = {
             "type": "message",
@@ -1534,12 +1680,15 @@ def send_summary_to_teams(emails, events, weather, vessels_info, pilot_status, t
 
 def run_summary_agent():
     log("=" * 60)
-    log("🚀 Email Assistant v20.0 FINAL - INTELLIGENT VERSION")
+    log("🚀 Email Assistant v21.0 - INTELLIGENT VERSION")
     log("✅ Email-to-Checklist | ✅ Anchored Date | ✅ Status Display")
     log("=" * 60)
 
 
     try:
+        # Fetch vessel list and timeline from OAS API first
+        fetch_oas_vessels()
+
         weather = get_weather_conditions()
         emails = fetch_emails() or []
 
@@ -1588,7 +1737,7 @@ def scheduled_run():
 
 if __name__ == "__main__":
     try:
-        log("🤖 Email Assistant Starting - v20.0 FINAL")
+        log("🤖 Email Assistant Starting - v21.0")
         log("📧 Smart Email Parsing Enabled")
         log("📊 Anchored Date Logic Active")
         log("🎯 Status Display Integrated")
