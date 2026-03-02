@@ -99,7 +99,13 @@ OAS_STATUS_TO   = 10             # Status to: Completed/On-going
 OAS_DAYS_AHEAD  = 14             # How many days ahead to fetch
 OAS_DAYS_BACK   = 2              # How many days back to include
 
-AGENT_EMAILS = ["wilhelmsen.com", "lbhnetherlands.com", "chemship.com", "vertomcory.com", "iss-shipping.com"]
+# Jetties to include in the timeline (Pernis only)
+OAS_ALLOWED_JETTIES = {"ST4", "ST17", "ST18", "ST35", "ST35A"}
+
+# Name prefixes/values to exclude (unassigned/placeholder vessels)
+OAS_EXCLUDE_NAME_PREFIXES = ("TBN", "UNASSIGNED", "TBA", "T.B.N", "T.B.A")
+
+AGENT_EMAILS= ["wilhelmsen.com", "lbhnetherlands.com", "chemship.com", "vertomcory.com", "iss-shipping.com"]
 
 CATEGORY_KEYWORDS = {
     "AGENT": [
@@ -277,6 +283,23 @@ def save_pilot_status(status):
     except:
         pass
 
+def get_oas_token():
+    """Read OAS-TOKEN from oas_token.txt. Returns None with a log message if missing/empty."""
+    token_file = "oas_token.txt"
+    if not os.path.exists(token_file):
+        log("⚠️ OAS: oas_token.txt not found — run refresh_token_helper.py each morning")
+        return None
+    try:
+        with open(token_file, "r") as f:
+            token = f.read().strip()
+        if not token:
+            log("⚠️ OAS: oas_token.txt is empty — run refresh_token_helper.py")
+            return None
+        return token
+    except Exception as e:
+        log(f"⚠️ OAS: Could not read oas_token.txt: {e}")
+        return None
+
 def fetch_oas_vessels():
     """Fetch the vessel/shipment list from the Shell OAS Shipment Planner API.
 
@@ -308,14 +331,44 @@ def fetch_oas_vessels():
             "TransportName": None
         }
 
+        # --- Get OAS session token ---
+        token = get_oas_token()
+        if not token:
+            return {}, []
+
+        # Clear bad proxy env vars — OAS must be called directly, no proxy
+        for _var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ.pop(_var, None)
+
         log(f"🌐 Fetching OAS vessel list ({date_from[:10]} → {date_to[:10]}) …")
         response = requests.post(
             OAS_API_URL,
             json=payload,
-            proxies=PROXIES,
+            headers={
+                "Content-Type": "application/json",
+                "Origin": "https://nl.oas.shell.com",
+                "User-Agent": "Mozilla/5.0",
+            },
+            cookies={"OAS-TOKEN": token},
+            proxies={"http": None, "https": None},  # bypass corporate proxy
             timeout=30,
             verify=False
         )
+
+        if response.status_code in (401, 403):
+            log("⚠️ OAS token expired — please run refresh_token_helper.py")
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    0,
+                    "OAS token expired.\n\nPlease run refresh_token_helper.py to refresh it.",
+                    "Email Assistant — OAS Token Expired",
+                    0x30
+                )
+            except Exception:
+                pass
+            return {}, []
+
         response.raise_for_status()
         data = response.json()
 
@@ -336,37 +389,57 @@ def fetch_oas_vessels():
         oas_vessels = []
 
         for record in data:
-            # Vessel name
-            name = (
-                record.get("TransportName") or
-                record.get("VesselName") or
-                record.get("ShipName") or ""
-            ).strip().upper()
-            if not name:
+            # Vessel name — confirmed field name from live API
+            name = str(record.get("TRANSPORT_NAME") or "").strip().upper()
+            if not name or name in ("NONE", "NULL", ""):
+                continue
+
+            # Skip TBN / UNASSIGNED / placeholder vessels
+            if any(name.startswith(prefix) for prefix in OAS_EXCLUDE_NAME_PREFIXES):
+                log(f"   ⏭️ Skipping placeholder vessel: {name}")
                 continue
 
             # Identifier (IMO preferred, then ENI)
-            imo = str(record.get("IMO") or record.get("Imo") or "").strip()
-            eni = str(record.get("ENI") or record.get("Eni") or "").strip()
+            imo = str(record.get("IMO") or "").strip()
+            eni = str(record.get("ENI") or "").strip()
             identifier = imo if imo else (f"EN{eni}" if eni else "")
             if identifier:
                 new_known[name] = identifier
 
-            # Dates
-            eta = (record.get("ETA") or record.get("Eta") or record.get("DateFrom") or "")
-            etd = (record.get("ETD") or record.get("Etd") or record.get("DateTo") or "")
+            # Dates — confirmed field names from live API
+            eta = str(record.get("ETA") or "").strip()
+            etd = str(record.get("ETD") or "").strip()
 
-            # Other fields
-            berth         = (record.get("BerthCode") or record.get("Berth") or record.get("JettyCode") or "")
-            grade         = (record.get("GradeName") or record.get("Grade") or "")
-            agent         = (record.get("AgentName") or record.get("Agent") or "")
-            surveyor      = (record.get("SurveyorName") or record.get("Surveyor") or "")
-            status_code   = record.get("NStatus") or record.get("StatusFrom") or 0
+            # Berth/Jetty — confirmed field name from live API
+            berth = str(record.get("BERTH") or "").strip()
+
+            # Normalise berth to jetty key e.g. "ST35A" or "ST-35A" → "ST35A"
+            jetty_key = berth.upper().replace("-", "").replace(" ", "")
+
+            # Skip vessels not at our allowed jetties
+            if jetty_key and jetty_key not in OAS_ALLOWED_JETTIES:
+                log(f"   ⏭️ Skipping vessel {name} at jetty {berth} (not in allowed list)")
+                continue
+
+            # Grade — from GRADES array (confirmed structure from live API)
+            grade = ""
+            grades = record.get("GRADES") or []
+            if grades and isinstance(grades, list):
+                grade_descs = [g.get("GRADE_DESC", "") for g in grades if g.get("GRADE_DESC")]
+                grade = ", ".join(grade_descs[:2])
+
+            # Other confirmed CAPS field names from live API
+            agent        = str(record.get("AGENT_ID") or "").strip()
+            surveyor     = str(record.get("INSPECTOR_ID") or "").strip()
+            shipment_ref = str(record.get("SHIPMENT_REF") or record.get("SHIPMENT_ID") or "").strip()
+            site         = str(record.get("SITE") or "").strip()
+
+            # Status — NOM_NSTATUS confirmed from live API
+            status_code = record.get("NOM_NSTATUS") or record.get("SHIPMENT_STATUS") or 0
             try:
-                status_label  = STATUS_MAP.get(int(status_code), str(status_code)) if status_code else ""
+                status_label = STATUS_MAP.get(int(status_code), str(status_code)) if status_code else ""
             except (ValueError, TypeError):
-                status_label  = str(status_code)
-            shipment_ref  = (record.get("ShipmentRef") or record.get("ShipmentId") or "")
+                status_label = str(status_code)
 
             oas_vessels.append({
                 "name":         name,
@@ -374,11 +447,15 @@ def fetch_oas_vessels():
                 "eta":          eta,
                 "etd":          etd,
                 "berth":        berth,
+                "jetty":        jetty_key,   # normalised jetty key for timeline grouping
+                "cargo":        grade,
                 "grade":        grade,
                 "agent":        agent,
-                "surveyor":     surveyor,
+                "surveyor":     surveyor if surveyor not in ("NIET VAN TOEPASSING", "NONE", "") else "",
                 "status":       status_label,
+                "status_desc":  status_label,
                 "shipment_ref": shipment_ref,
+                "site":         site,
                 "source":       "OAS"
             })
 
