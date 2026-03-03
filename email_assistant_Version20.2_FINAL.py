@@ -701,6 +701,14 @@ def update_checklists(timeline):
                     if vessel_name in checklists:
                         checklist = checklists[vessel_name]
 
+                        # Keep ETA and jetty in sync with OAS data
+                        if checklist.get('eta') != eta:
+                            log(f"   📅 Updated ETA for {vessel_name}: {checklist.get('eta')} -> {eta}")
+                            checklist['eta'] = eta
+                        if jetty and jetty != 'TBD' and checklist.get('jetty', 'TBD') == 'TBD':
+                            checklist['jetty'] = jetty
+                            log(f"   📍 Synced jetty for {vessel_name}: {jetty}")
+
                         for item in checklist.get('items', []):
                             task_lower = item['task'].lower()
 
@@ -1057,6 +1065,38 @@ def generate_smart_reply(email, weather=None):
 # CALENDAR
 # =========================================================
 
+def get_oas_token():
+    """Read OAS-TOKEN from oas_token.txt.
+    Shows a Windows message box and returns None if the token is missing or empty.
+    Call this once per cycle before making OAS API calls.
+    """
+    token_file = "oas_token.txt"
+    if not os.path.exists(token_file):
+        log("⚠️ OAS: oas_token.txt not found — run refresh_token_helper.py each morning")
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "oas_token.txt not found.\n\nPlease run refresh_token_helper.py to create it.\n\n"
+                "Steps:\n1. Open refresh_token_helper.py\n2. Run it\n3. Restart Email Assistant",
+                "Email Assistant — OAS Token Missing",
+                0x30
+            )
+        except Exception:
+            pass
+        return None
+    try:
+        with open(token_file, "r") as f:
+            token = f.read().strip()
+        if not token:
+            log("⚠️ OAS: oas_token.txt is empty — run refresh_token_helper.py")
+            return None
+        return token
+    except Exception as e:
+        log(f"⚠️ OAS: Could not read oas_token.txt: {e}")
+        return None
+
+
 def fetch_oas_vessels():
     """Fetch the vessel/shipment list from the Shell OAS Shipment Planner API.
 
@@ -1073,14 +1113,8 @@ def fetch_oas_vessels():
         date_to   = (now + timedelta(days=OAS_DAYS_AHEAD)).strftime(f"%Y-%m-%dT00:00:00{tz_offset}")
 
         # Read token from file
-        token_file = "oas_token.txt"
-        if not os.path.exists(token_file):
-            log("⚠️ OAS: oas_token.txt not found — create it with your OAS-TOKEN cookie value")
-            return {}, []
-        with open(token_file) as f:
-            token = f.read().strip()
+        token = get_oas_token()
         if not token:
-            log("⚠️ OAS: oas_token.txt is empty")
             return {}, []
 
         payload = {
@@ -1107,8 +1141,8 @@ def fetch_oas_vessels():
 
         log(f"🌐 Fetching OAS vessel list ({date_from[:10]} → {date_to[:10]}) …")
 
-        # Clear proxy environment variables — OAS must be reached directly
-        for _var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        # Force clear all proxy env vars before OAS call
+        for _var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
             os.environ.pop(_var, None)
 
         response = requests.post(
@@ -1123,6 +1157,17 @@ def fetch_oas_vessels():
 
         if response.status_code in (401, 403):
             log("⚠️ OAS token rejected (401/403) — update oas_token.txt with a fresh token")
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    0,
+                    "OAS token expired.\n\nPlease run refresh_token_helper.py to refresh it.\n\n"
+                    "Steps:\n1. Open refresh_token_helper.py\n2. Run it\n3. Restart Email Assistant",
+                    "Email Assistant — OAS Token Expired",
+                    0x30
+                )
+            except Exception:
+                pass
             return {}, []
 
         response.raise_for_status()
