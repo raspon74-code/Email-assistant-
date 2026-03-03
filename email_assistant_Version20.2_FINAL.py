@@ -643,6 +643,10 @@ def create_arrival_checklist(vessel_name, eta, jetty=None):
         vessel_id = KNOWN_VESSELS.get(vessel_name)
         is_barge = vessel_id and len(str(vessel_id)) == 8
 
+        # Normalise jetty key (e.g. "ST-35A" → "ST35A")
+        if jetty and jetty != 'TBD':
+            jetty = str(jetty).upper().replace("-", "").replace(" ", "")
+
         items = [
             {'task': 'Pilot booking confirmed', 'deadline': '24h', 'status': 'PENDING', 'critical': True},
             {'task': 'Berth availability confirmed', 'deadline': '24h', 'status': 'PENDING', 'critical': True},
@@ -668,21 +672,23 @@ def create_arrival_checklist(vessel_name, eta, jetty=None):
         return None
 
 def update_checklists(timeline):
-    """Smart checklist updates from Excel data"""
+    """Smart checklist updates from OAS/timeline data"""
     try:
         checklists = load_checklists()
         now = datetime.now()
         updates_made = 0
 
-        log("📋 Updating checklists from Excel...")
+        log("📋 Updating checklists from timeline...")
 
         for vessel in timeline.get('vessels', []):
             vessel_name = vessel['name']
             eta = vessel.get('eta')
-            jetty = vessel.get('jetty')
+            # Bug 1 fix: fallback to 'berth' if 'jetty' is empty; normalise key
+            jetty_raw = vessel.get('jetty') or vessel.get('berth') or 'TBD'
+            jetty = str(jetty_raw).upper().replace("-", "").replace(" ", "") if jetty_raw != 'TBD' else 'TBD'
 
             status_desc = vessel.get('status_desc', '').lower()
-            ship_inspector = vessel.get('ship_inspector', 'NONE')
+            ship_inspector = vessel.get('ship_inspector') or vessel.get('surveyor') or 'NONE'
 
             if not eta:
                 continue
@@ -691,15 +697,21 @@ def update_checklists(timeline):
                 eta_date = datetime.fromisoformat(eta)
                 hours_until = (eta_date - now).total_seconds() / 3600
 
-                if -24 < hours_until < 72:
+                # Bug 2 fix: widened window from -24 to -48 to keep overdue vessels
+                if -48 < hours_until < 72:
                     if vessel_name not in checklists:
                         new_checklist = create_arrival_checklist(vessel_name, {'date': eta}, jetty)
                         if new_checklist:
                             checklists[vessel_name] = new_checklist
-                            log(f"   📋 Created checklist: {vessel_name} (ETA in {hours_until:.1f}h)")
+                            log(f"   📋 Created checklist: {vessel_name} @ {jetty} (ETA in {hours_until:.1f}h)")
 
                     if vessel_name in checklists:
                         checklist = checklists[vessel_name]
+
+                        # Bug 3 fix: sync jetty if it was TBD at creation time
+                        if jetty != 'TBD' and checklist.get('jetty', 'TBD') == 'TBD':
+                            checklist['jetty'] = jetty
+                            log(f"   📍 Synced jetty for {vessel_name}: {jetty}")
 
                         for item in checklist.get('items', []):
                             task_lower = item['task'].lower()
@@ -710,7 +722,7 @@ def update_checklists(timeline):
                             if "released to operations" in status_desc:
                                 if any(kw in task_lower for kw in ['agent notified', 'berth availability', 'loading plan']):
                                     item['status'] = 'COMPLETED'
-                                    item['completed_by'] = '📊 AUTO: Excel'
+                                    item['completed_by'] = '📊 AUTO: OAS'
                                     item['completed_at'] = now.isoformat()
                                     updates_made += 1
                                     log(f"   ✅ {vessel_name}: {item['task']}")
@@ -728,9 +740,9 @@ def update_checklists(timeline):
                 continue
 
         if updates_made > 0:
-            log(f"✅ Excel-based: {updates_made} checklist items completed")
+            log(f"✅ Timeline-based: {updates_made} checklist items completed")
         else:
-            log("   No Excel-based updates needed")
+            log("   No timeline-based updates needed")
 
         save_checklists(checklists)
         return checklists
@@ -759,7 +771,7 @@ def cleanup_old_checklists(checklists, timeline):
                     eta_date = datetime.fromisoformat(eta)
                     hours_until = (eta_date - now).total_seconds() / 3600
 
-                    if hours_until < -24 or hours_until > 72:
+                    if hours_until < -48 or hours_until > 72:
                         to_remove.append(vessel_name)
                 except:
                     pass
@@ -795,7 +807,7 @@ def get_checklist_summary(checklists):
             except:
                 continue
 
-            if hours_until < -24 or hours_until > 72:
+            if hours_until < -48 or hours_until > 72:
                 continue
 
             summary['total'] += 1
@@ -1562,6 +1574,13 @@ def send_summary_to_teams(emails, events, weather, vessels_info, pilot_status, t
                 anchored_date = vessel_data.get('anchored_date', '') if vessel_data else ''
                 countdown, color = get_eta_countdown(ck['eta'], anchored_date)
 
+                # Resolve jetty: prefer timeline, fall back to checklist
+                resolved_jetty = ck['jetty']
+                if vessel_data:
+                    tl_jetty = vessel_data.get('jetty') or vessel_data.get('berth') or ''
+                    if tl_jetty and tl_jetty != 'TBD':
+                        resolved_jetty = tl_jetty
+
                 checklist_items = [
                     {
                         "type": "ColumnSet",
@@ -1571,7 +1590,7 @@ def send_summary_to_teams(emails, events, weather, vessels_info, pilot_status, t
                                 "width": "stretch",
                                 "items": [{
                                     "type": "TextBlock",
-                                    "text": f"🚢 **{ck['vessel']}** — {ck['jetty']}",
+                                    "text": f"🚢 **{ck['vessel']}** — {resolved_jetty}",
                                     "weight": "Bolder",
                                     "size": "Medium"
                                 }]
