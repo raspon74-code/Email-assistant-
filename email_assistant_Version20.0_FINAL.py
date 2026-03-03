@@ -1,5 +1,5 @@
 """
-Version 20.0 FINAL – Email Assistant - INTELLIGENT PRODUCTION VERSION
+Version 21.0 FINAL – Email Assistant - INTELLIGENT PRODUCTION VERSION
 
 NEW FEATURES:
 ✅ Smart Email-to-Checklist Integration (keyword parsing)
@@ -9,6 +9,8 @@ NEW FEATURES:
 ✅ Source Tracking (📧 email vs 📊 Excel)
 ✅ Conflict Detection (email vs Excel discrepancies)
 ✅ Confidence Scoring (how certain we are about updates)
+✅ Token Refresh Helper integrated (get_oas_token with Windows popup)
+✅ ETA & Jetty sync in arrival checklists
 
 EXISTING FEATURES:
 ✅ Calendar Integration
@@ -656,6 +658,83 @@ def create_arrival_checklist(vessel_name, eta, jetty=None):
     except:
         return None
 
+def get_oas_token():
+    """Read OAS-TOKEN from oas_token.txt.
+    Shows a Windows message box and returns None if the token is missing/empty/expired.
+    """
+    token_file = "oas_token.txt"
+    if not os.path.exists(token_file):
+        log("⚠️ OAS: oas_token.txt not found — run refresh_token_helper.py each morning")
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "oas_token.txt not found.\n\nPlease run refresh_token_helper.py to create it.",
+                "Email Assistant — OAS Token Missing",
+                0x30
+            )
+        except Exception:
+            pass
+        return None
+    try:
+        with open(token_file, "r") as f:
+            token = f.read().strip()
+        if not token:
+            log("⚠️ OAS: oas_token.txt is empty — run refresh_token_helper.py")
+            return None
+        return token
+    except Exception as e:
+        log(f"⚠️ OAS: Could not read oas_token.txt: {e}")
+        return None
+
+def fetch_oas_vessels():
+    """Fetch vessel list from OAS API and update KNOWN_VESSELS."""
+    try:
+        token = get_oas_token()
+        if not token:
+            log("⚠️ OAS: Skipping vessel fetch — no valid token")
+            return {}, []
+
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        response = requests.post(
+            "https://oas.shell.com/api/vessels",
+            headers=headers,
+            proxies=PROXIES,
+            timeout=15,
+            verify=False
+        )
+
+        if response.status_code in (401, 403):
+            log("⚠️ OAS token expired — please run refresh_token_helper.py")
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    0,
+                    "OAS token expired.\n\nPlease run refresh_token_helper.py to refresh it.",
+                    "Email Assistant — OAS Token Expired",
+                    0x30
+                )
+            except Exception:
+                pass
+            return {}, []
+
+        response.raise_for_status()
+        data = response.json()
+        vessels = data if isinstance(data, list) else data.get('vessels', [])
+
+        for v in vessels:
+            name = v.get('name', '').upper().strip()
+            imo = v.get('imo') or v.get('identifier', '')
+            if name and imo:
+                KNOWN_VESSELS[name] = str(imo)
+
+        log(f"✅ OAS: {len(vessels)} vessels fetched, KNOWN_VESSELS updated")
+        return {v.get('name', '').upper(): v for v in vessels if v.get('name')}, vessels
+
+    except Exception as e:
+        log(f"⚠️ OAS fetch error: {e}")
+        return {}, []
+
 def update_checklists(timeline):
     """Smart checklist updates from Excel data"""
     try:
@@ -690,6 +769,16 @@ def update_checklists(timeline):
                     if vessel_name in checklists:
                         checklist = checklists[vessel_name]
 
+                        # Sync ETA if it has changed
+                        if checklist.get('eta') != eta:
+                            log(f"   📅 Updated ETA for {vessel_name}: {checklist.get('eta')} -> {eta}")
+                            checklist['eta'] = eta
+
+                        # Sync jetty if it was TBD at creation time
+                        if jetty and jetty != 'TBD' and checklist.get('jetty', 'TBD') == 'TBD':
+                            checklist['jetty'] = jetty
+                            log(f"   📍 Synced jetty for {vessel_name}: {jetty}")
+
                         for item in checklist.get('items', []):
                             task_lower = item['task'].lower()
 
@@ -699,7 +788,7 @@ def update_checklists(timeline):
                             if "released to operations" in status_desc:
                                 if any(kw in task_lower for kw in ['agent notified', 'berth availability', 'loading plan']):
                                     item['status'] = 'COMPLETED'
-                                    item['completed_by'] = '📊 AUTO: Excel'
+                                    item['completed_by'] = '📊 AUTO: OAS'
                                     item['completed_at'] = now.isoformat()
                                     updates_made += 1
                                     log(f"   ✅ {vessel_name}: {item['task']}")
@@ -1485,7 +1574,7 @@ def send_summary_to_teams(emails, events, weather, vessels_info, pilot_status, t
         else:
             card_body.append({"type": "TextBlock", "text": "✅ No meetings scheduled", "color": "Good"})
 
-        card_body.append({"type": "TextBlock", "text": f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | v20.0 FINAL", "size": "Small", "isSubtle": True, "separator": True})
+        card_body.append({"type": "TextBlock", "text": f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | v21.0 FINAL", "size": "Small", "isSubtle": True, "separator": True})
 
         payload = {
             "type": "message",
@@ -1534,12 +1623,15 @@ def send_summary_to_teams(emails, events, weather, vessels_info, pilot_status, t
 
 def run_summary_agent():
     log("=" * 60)
-    log("🚀 Email Assistant v20.0 FINAL - INTELLIGENT VERSION")
+    log("🚀 Email Assistant v21.0 FINAL - INTELLIGENT VERSION")
     log("✅ Email-to-Checklist | ✅ Anchored Date | ✅ Status Display")
     log("=" * 60)
 
 
     try:
+        # Fetch fresh vessel list from OAS API
+        fetch_oas_vessels()
+
         weather = get_weather_conditions()
         emails = fetch_emails() or []
 
@@ -1588,7 +1680,7 @@ def scheduled_run():
 
 if __name__ == "__main__":
     try:
-        log("🤖 Email Assistant Starting - v20.0 FINAL")
+        log("🤖 Email Assistant Starting - v21.0 FINAL")
         log("📧 Smart Email Parsing Enabled")
         log("📊 Anchored Date Logic Active")
         log("🎯 Status Display Integrated")
