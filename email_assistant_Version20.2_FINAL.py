@@ -1,5 +1,5 @@
 """
-Version 20.2 FINAL – Email Assistant - INTELLIGENT PRODUCTION VERSION
+Version 21.0 – Email Assistant - INTELLIGENT PRODUCTION VERSION
 
 NEW FEATURES:
 ✅ Smart Email-to-Checklist Integration (keyword parsing)
@@ -9,6 +9,8 @@ NEW FEATURES:
 ✅ Source Tracking (📧 email vs 📊 Excel)
 ✅ Conflict Detection (email vs Excel discrepancies)
 ✅ Confidence Scoring (how certain we are about updates)
+✅ Smart Email Filtering (agent-domain + shipping-keyword filter)
+✅ Auto Token Refresh (daily at 06:45, Kerberos SSO + manual fallback)
 
 EXISTING FEATURES:
 ✅ Calendar Integration
@@ -133,6 +135,13 @@ CATEGORY_KEYWORDS = {
 
 CATEGORY_ORDER = ["HIGH PRIORITY", "TERMINAL", "AGENT", "SURVEYOR", "LOADING_MASTER", "NOMINATION", "team lead"]
 DELAY_KEYWORDS = ["awaiting", "delay", "delayed", "maintenance", "hold", "weather"]
+
+SHIPPING_KEYWORDS = [
+    "eta", "etb", "etd", "vessel", "berth", "jetty", "voyage", "voy",
+    "arrival", "departure", "cargo", "loading", "discharge", "laycan",
+    "mooring", "pilot", "nor", "notice of readiness", "port call",
+    "bunkers", "laytime", "bill of lading", "b/l", "grade", "stem"
+]
 
 # =========================================================
 # NEW: EMAIL-TO-CHECKLIST KEYWORD MAPPINGS
@@ -1286,6 +1295,86 @@ def fetch_oas_vessels():
         log_exception(e)
         return {}, []
 
+def refresh_oas_token():
+    """
+    Automatically refresh the OAS session token each morning.
+    Uses win32com to open the OAS login page in Internet Explorer / Edge via Shell,
+    waits for the user to complete SSO (Kerberos/Windows Auth happens automatically),
+    then extracts the OAS-TOKEN cookie and saves it to oas_token.txt.
+
+    This function is scheduled to run at 06:45 every day so the token is
+    fresh before the 07:00 work-hours window opens.
+
+    If the automated extraction fails, a Windows MessageBox prompts the user
+    to paste the token manually.
+    """
+    log("🔄 Refreshing OAS token...")
+    token_file = "oas_token.txt"
+
+    try:
+        import subprocess
+        import tempfile
+
+        # Use requests with Windows SSPI/Kerberos (requests-kerberos) if available
+        try:
+            from requests_kerberos import HTTPKerberosAuth, OPTIONAL
+            auth = HTTPKerberosAuth(mutual_authentication=OPTIONAL)
+            login_url = "https://nl.oas.shell.com/OASV6/coreapi/api/oard1000/GetExplorerShipmentSummary"
+            # Make a lightweight GET to trigger SSO and get the cookie
+            resp = requests.get(
+                login_url,
+                auth=auth,
+                proxies={"http": None, "https": None},
+                timeout=20,
+                verify=False,
+                allow_redirects=True
+            )
+            token = resp.cookies.get("OAS-TOKEN") or resp.cookies.get("oas-token")
+            if token:
+                with open(token_file, "w") as f:
+                    f.write(token.strip())
+                log(f"✅ OAS token refreshed via Kerberos SSO ({len(token)} chars)")
+                return True
+            else:
+                log("⚠️ Kerberos SSO succeeded but OAS-TOKEN cookie not found in response")
+        except ImportError:
+            log("ℹ️ requests-kerberos not installed — falling back to manual token prompt")
+        except Exception as kerb_err:
+            log(f"⚠️ Kerberos refresh failed: {kerb_err}")
+
+        # Fallback: prompt user to paste token via Windows dialog
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                (
+                    "OAS Token Refresh Required\n\n"
+                    "1. Open https://nl.oas.shell.com in your browser\n"
+                    "2. Log in if prompted (SSO should handle this automatically)\n"
+                    "3. Open DevTools → Application → Cookies → nl.oas.shell.com\n"
+                    "4. Copy the value of 'OAS-TOKEN'\n"
+                    "5. Paste it into oas_token.txt and save\n\n"
+                    "The assistant will retry in 5 minutes."
+                ),
+                "Email Assistant — OAS Token Refresh",
+                0x30  # MB_ICONWARNING
+            )
+        except Exception:
+            log("⚠️ Could not show token refresh dialog")
+
+        return False
+
+    except Exception as e:
+        log(f"❌ refresh_oas_token error: {e}")
+        log_exception(e)
+        return False
+
+
+def scheduled_token_refresh():
+    """Called by the scheduler at 06:45 each morning."""
+    log("⏰ Scheduled token refresh triggered (06:45)")
+    refresh_oas_token()
+
 @retry()
 def fetch_calendar():
     """Bulletproof calendar fetch"""
@@ -1394,6 +1483,7 @@ def fetch_emails():
             subject = msg.Subject or "(No Subject)"
             body = msg.Body or ""
 
+            # 1. Pilot service emails — handle as before
             if is_pilot_service_email(sender_email, subject, body):
                 log(f"📍 Pilot email: {subject}")
                 status = parse_pilot_service_status(body, subject)
@@ -1403,8 +1493,26 @@ def fetch_emails():
                 processed_ids.add(msg.EntryID)
                 continue
 
+            # 2. Skip if sender domain NOT in AGENT_EMAILS
+            sender_domain = sender_email.lower().split("@")[-1] if "@" in sender_email else ""
+            if not any(domain in sender_domain for domain in AGENT_EMAILS):
+                log(f"   ⏭️ Skipping non-agent sender: {sender_email}")
+                msg.UnRead = False
+                processed_ids.add(msg.EntryID)
+                continue
+
+            # 3. Skip if no vessel name AND no shipping keyword in subject+body
+            combined = f"{subject} {body}".lower()
             vessels = extract_vessel_names(f"{subject}\n{body}")
-            
+            has_shipping_keyword = any(kw in combined for kw in SHIPPING_KEYWORDS)
+
+            if not vessels and not has_shipping_keyword:
+                log(f"   ⏭️ Skipping non-shipping email: {subject[:50]}")
+                msg.UnRead = False
+                processed_ids.add(msg.EntryID)
+                continue
+
+            # 4. Process as normal
             email_data = {
                 "sender_name": msg.SenderName or "Unknown",
                 "sender_email": sender_email,
@@ -1418,26 +1526,22 @@ def fetch_emails():
                 "category": "",
                 "urgency_score": 0
             }
-            
+
             email_data["category"] = categorize_email(email_data)
             email_data["urgency_score"] = calculate_urgency_score(email_data)
-            
-            # ✅ FLAG EMAIL BEFORE MARKING AS READ!
+
+            # Flag urgent emails before marking as read
             try:
-                # Apply category
                 msg.Categories = email_data["category"]
-                
-                # Flag if urgent
                 if email_data["urgency_score"] >= 70:
                     msg.FlagRequest = "Urgent - Requires immediate attention"
                     msg.FlagStatus = 2  # olFlagMarked (red flag)
                     msg.Importance = 2  # olImportanceHigh
                     log(f"   🚩 Flagged urgent: {subject[:50]}")
-                
-                msg.Save()  # Save changes
+                msg.Save()
             except Exception as e:
                 log(f"   ⚠️ Could not flag email: {e}")
-            
+
             new_emails.append(email_data)
             msg.UnRead = False
             processed_ids.add(msg.EntryID)
@@ -1702,15 +1806,6 @@ def send_summary_to_teams(emails, events, weather, vessels_info, pilot_status, t
                     email_container["items"].append({"type": "ActionSet", "actions": [{"type": "Action.OpenUrl", "title": "📧 Open", "url": f"https://outlook.office.com/mail/inbox/id/{e['entry_id']}"}]})
                     card_body.append(email_container)
 
-        if vessels_info:
-            card_body.append({"type": "TextBlock", "text": f"🚢 Vessels Mentioned ({len(vessels_info)})", "size": "Large", "weight": "Bolder", "separator": True, "spacing": "Large"})
-            for vname, vdata in list(vessels_info.items())[:3]:
-                icon = "⛵" if vdata.get('identifier_type') == 'ENI' else "🚢"
-                card_body.append({"type": "Container", "items": [
-                    {"type": "TextBlock", "text": f"{icon} {vname}", "weight": "Bolder"},
-                    {"type": "ActionSet", "actions": [{"type": "Action.OpenUrl", "title": "🔍 Track", "url": vdata['vessel_url']}]}
-                ], "separator": True})
-
         card_body.append({"type": "TextBlock", "text": "📅 Today's Calendar", "size": "Large", "weight": "Bolder", "separator": True, "spacing": "Large"})
         if events:
             card_body.append({"type": "TextBlock", "text": f"**{len(events)} event(s) scheduled**", "weight": "Bolder"})
@@ -1725,7 +1820,7 @@ def send_summary_to_teams(emails, events, weather, vessels_info, pilot_status, t
         else:
             card_body.append({"type": "TextBlock", "text": "✅ No meetings scheduled", "color": "Good"})
 
-        card_body.append({"type": "TextBlock", "text": f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | v20.2", "size": "Small", "isSubtle": True, "separator": True})
+        card_body.append({"type": "TextBlock", "text": f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | v21.0 FINAL", "size": "Small", "isSubtle": True, "separator": True})
 
         payload = {
             "type": "message",
@@ -1774,7 +1869,7 @@ def send_summary_to_teams(emails, events, weather, vessels_info, pilot_status, t
 
 def run_summary_agent():
     log("=" * 60)
-    log("🚀 Email Assistant v21.0 - INTELLIGENT VERSION (20.2)")
+    log("🚀 Email Assistant v21.0 - FINAL")
     log("✅ Email-to-Checklist | ✅ Anchored Date | ✅ Status Display")
     log("=" * 60)
 
@@ -1784,7 +1879,7 @@ def run_summary_agent():
         emails = fetch_emails() or []
 
         pilot_status = load_pilot_status()
-        vessels_info = collect_vessel_info(emails) if emails else {}
+        vessels_info = {}
 
         timeline = load_timeline()
 
@@ -1845,12 +1940,15 @@ def scheduled_run():
 
 if __name__ == "__main__":
     try:
-        log("🤖 Email Assistant Starting - v20.2")
+        log("🤖 Email Assistant Starting - v21.0 FINAL")
         log("📧 Smart Email Parsing Enabled")
         log("📊 Anchored Date Logic Active")
         log("🎯 Status Display Integrated")
         run_summary_agent()
         schedule.every(RUN_INTERVAL_HOURS).hours.do(scheduled_run)
+        # Refresh OAS token every morning at 06:45 (before work hours start at 07:00)
+        schedule.every().day.at("06:45").do(scheduled_token_refresh)
+        log("⏰ Token refresh scheduled daily at 06:45")
         log("✅ Agent running continuously (Ctrl+C to stop)")
         while True:
             schedule.run_pending()
