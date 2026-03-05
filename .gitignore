@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+oas_token.txt
+oas_cookies.txt
